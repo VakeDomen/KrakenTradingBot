@@ -12,3 +12,4 @@ Cargo.lock
 creds.json
 last.json
 last.txt
+last_completed.json

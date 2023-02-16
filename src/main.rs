@@ -1,7 +1,7 @@
 
 use chrono::Local;
 use krakenrs::ws::{KrakenWsConfig, KrakenWsAPI, BookData};
-use krakenrs::{KrakenRestConfig, KrakenRestAPI, KrakenCredentials, BsType, LimitOrder, AddOrderResponse, GetOpenOrdersResponse};
+use krakenrs::{KrakenRestConfig, KrakenRestAPI, KrakenCredentials, BsType, LimitOrder, AddOrderResponse, GetOpenOrdersResponse, CancelAllOrdersResponse};
 use once_cell::sync::Lazy;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -33,6 +33,12 @@ pub static LAST_ORDER: Lazy<Mutex<(f64, bool, )>> = Lazy::new(|| {
         Err(e) => panic!("No price history! Can't calculate gainz!: {}", e.to_string()),
     }
 });
+pub static LAST_COMPLETED_ORDER: Lazy<Mutex<(f64, bool, )>> = Lazy::new(|| {
+    match serde_any::from_file("last_completed.json") {
+        Ok(hm) => Mutex::new(hm),
+        Err(e) => panic!("No price history of last completed order!: {}", e.to_string()),
+    }
+});
 // BTC, ETH, ETH/BTC
 pub static CURRENT_PRICES: Lazy<Mutex<(Option<f64>, Option<f64>, Option<f64>)>> = Lazy::new(|| {
     Mutex::new((None, None, None))
@@ -60,99 +66,110 @@ async fn main() {
         None => panic!("Couldn't get account balance!"),
     };
     let mut balance_stained = false;
-    let mut time_to_wait_in_millis = 1000;
+    let mut time_to_wait_in_millis = 5000;
 
+    /*
+     * reconnection loop 
+     */
     loop {
         /*
-         * slow down the loop
-         */ 
-        thread::sleep(Duration::from_millis(time_to_wait_in_millis));
-        /*
-         *  check order resolution update 
-         *  NOTE: must be above balance update, so it 
-         *  updates after order resolution
-         */
-        if is_waiting_order_resolution() {
-            time_to_wait_in_millis = 30000;
-            let orders = get_open_orders();
-            match orders {
-                Ok(ord) => {
-                    if ord.open.len() == 0 {
-                        complete_last_order();
-                        time_to_wait_in_millis = 5000;
-                        notify_order_completed_telegram();
-                    }
-                },
-                Err(e) => { println!("[{} | ORDER RESOLUTION WAIT] Could not fetch open orders: {}", time(), e.to_string())},
+        * main loop
+        */
+        loop {
+            /*
+            * slow down the loop
+            */ 
+            thread::sleep(Duration::from_millis(time_to_wait_in_millis));
+            /*
+            *  check order resolution update 
+            *  NOTE: must be above balance update, so it 
+            *  updates after order resolution
+            */
+            if is_waiting_order_resolution() {
+                time_to_wait_in_millis = 30000;
+                let orders = get_open_orders();
+                match orders {
+                    Ok(ord) => {
+                        if ord.open.len() == 0 {
+                            complete_last_order();
+                            time_to_wait_in_millis = 5000;
+                            notify_order_completed_telegram();
+                        }
+                    },
+                    Err(e) => { println!("[{} | ORDER RESOLUTION WAIT] Could not fetch open orders: {}", time(), e.to_string())},
+                }
+                println!("[{} | ORDER RESOLUTION WAIT] Waiting for order to resolve", time());
+                continue;
             }
-            println!("[{} | ORDER RESOLUTION WAIT] Waiting for order to resolve", time());
-            continue;
-        }
 
-        /*
-         * update prices on tick
-         */
-        update_prices(block_in_place(|| ws.get_all_books()));
+            /*
+            * update prices on tick
+            */
+            update_prices(block_in_place(|| ws.get_all_books()));
 
-        /*
-         * get my balance
-         */
-        if balance_stained {
-            balance = match get_account_balance() {
-                Some(bal) => bal,
-                None => panic!("[{} | LOOP] Error getting account balance", time()),
+            /*
+            * get my balance
+            */
+            if balance_stained {
+                balance = match get_account_balance() {
+                    Some(bal) => bal,
+                    None => panic!("[{} | LOOP] Error getting account balance", time()),
+                };
+                balance_stained = false;
+            }
+
+            /*
+            * calc my position from balance 
+            */
+            let position = get_my_position(&balance);
+
+            /*
+            * get current gain
+            */
+            let gain = match calculate_gain(&position) {
+                Some(gain) => gain,
+                None => panic!("[{} | LOOP] Error calculating gain!", time()),
             };
-            balance_stained = false;
-        }
+            println!("GAIN: {:#?}", gain);
 
-        /*
-         * calc my position from balance 
-         */
-        let position = get_my_position(&balance);
-        println!("POSITION: {:#?}", position);
-
-        /*
-         * get current gain
-         */
-        let gain = match calculate_gain(&position) {
-            Some(gain) => gain,
-            None => panic!("[{} | LOOP] Error calculating gain!", time()),
-        };
-        println!("GAIN: {:#?}", gain);
-
-        /*
-         * hop strat eval
-         */
-        let should_hop = match position {
-            Position::Btc => gain > 0.017,
-            Position::Eth => gain > 0.05,
-            Position::None => false,
-        };
-
-        /*
-         * execute hop
-         */
-        if should_hop {
-            match execute_hop(&position, &balance) {
-                Ok((order_response, price)) => {
-                    println!("[{} | EXECUTED TRADE] Order placed: {:#?}", time(), order_response); 
-                    update_last_order(price);
-                    balance_stained = true;
-                    notify_order_placed_telegram(&order_response, &price, &gain, &position);
-                },
-                Err(e) => panic!("PANIC: {}", e.to_string())
+            /*
+            * hop strat eval
+            */
+            let should_hop = match position {
+                Position::Btc => gain > 0.02,
+                Position::Eth => gain > 0.05,
+                Position::None => false,
             };
-        }
 
-        /*
-         * stop loop on stream closed 
-         */
-        if ws.stream_closed() { 
-            println!("Stream closed");
-            return; 
+            /*
+            * execute hop
+            */
+            if should_hop {
+                match execute_hop(&position, &balance) {
+                    Ok((order_response, price)) => {
+                        println!("[{} | EXECUTED TRADE] Order placed: {:#?}", time(), order_response); 
+                        update_last_order(price);
+                        balance_stained = true;
+                        notify_order_placed_telegram(&order_response, &price, &gain, &position);
+                    },
+                    Err(e) => panic!("PANIC: {}", e.to_string())
+                };
+            }
+
+            /*
+            * stop loop on stream closed 
+            */
+            if ws.stream_closed() { 
+                println!("Stream closed");
+                notify_stream_close();
+                break; 
+            }
         }
+        thread::sleep(Duration::from_secs(10))
     }
 }
+
+
 
 fn check_env() {
     dotenv().ok();
@@ -173,9 +190,13 @@ fn update_last_order(price: f64) {
 fn complete_last_order() {
     {
         let mut last = LAST_ORDER.lock().unwrap();
+        let mut last_completed = LAST_COMPLETED_ORDER.lock().unwrap();
         last.1 = true;
+        last_completed.0 = last.0;
+        last_completed.1 = last.1;
     }
-    save_last_order()
+    save_last_order();
+    save_last_completed_order();
 }
 
 fn get_open_orders() -> Result<GetOpenOrdersResponse, krakenrs::Error> {
@@ -186,6 +207,14 @@ fn get_open_orders() -> Result<GetOpenOrdersResponse, krakenrs::Error> {
 fn is_waiting_order_resolution() -> bool {
     let last = LAST_ORDER.lock().unwrap();
     !last.1
+}
+
+fn converted_volume(position: &Position, volume: f64) -> f64 {
+    match position {
+        Position::Btc => volume / get_currnet_relative_price().unwrap(),
+        Position::Eth => volume,
+        Position::None => 0.,
+    }
 }
 
 fn execute_hop(position: &Position, balance: &HashMap<String, Decimal>) -> Result<(AddOrderResponse, f64), Error> {
@@ -207,13 +236,16 @@ fn execute_hop(position: &Position, balance: &HashMap<String, Decimal>) -> Resul
         )),
     };
 
-    let volume = match volume_option {
-        Some(vol) => vol.to_f64().unwrap().to_string(),
+    let base_volume = match volume_option {
+        Some(vol) => vol.to_f64().unwrap(),
         None => return Err(Error::new(
             ErrorKind::Other, 
             format!("[{} | EXECUTE HOP] Error geting volume from balance!", time())
         )),
     };
+
+    let volume = converted_volume(position, base_volume).to_string();
+
     let pair = "ETH/BTC".to_string();
 
     let price_float = match get_currnet_relative_price() {
@@ -238,7 +270,7 @@ fn execute_hop(position: &Position, balance: &HashMap<String, Decimal>) -> Resul
     block_in_place(|| match api.add_limit_order(
         limit_order, 
         None, 
-        true
+        false
     ) {
         Ok(r) => Ok((r, price_float)),
         Err(e) => Err(Error::new(
@@ -371,6 +403,14 @@ fn save_last_order() {
     };
 }
 
+fn save_last_completed_order() {
+    let last = LAST_COMPLETED_ORDER.lock().unwrap();
+    match serde_any::to_file("last_completed.json", &*last) {
+        Ok(_) => {();},
+        Err(e) => {println!("[{} | ORDER SAVE] Error saving last_completed.json: {:#?}", time(), e);}
+    };
+}
+
 fn get_my_position(balance: &HashMap<String, Decimal>) -> Position {
     let btc_position = match balance.get("XXBT") {
         Some(pos) => pos.to_f64().unwrap(),
@@ -382,8 +422,8 @@ fn get_my_position(balance: &HashMap<String, Decimal>) -> Position {
         None => 0.,
     };
 
-    let btc_eur = get_btc_value(btc_position);
-    let eth_eur = get_eth_value(eth_position);
+    let btc_eur = get_btc_value(btc_position).unwrap_or(0.);
+    let eth_eur = get_eth_value(eth_position).unwrap_or(0.);
 
     if btc_eur == 0. && eth_eur == 0. {
         Position::None
@@ -399,26 +439,41 @@ fn get_last_trade() -> (f64, bool) {
     (last.0, last.1)
 }
 
-fn get_btc_value(ammount: f64) -> f64 {
+fn load_previous_order() {
+    {
+        let mut last = LAST_ORDER.lock().unwrap();
+        let last_completed = LAST_COMPLETED_ORDER.lock().unwrap();
+        last.0 = last_completed.0;
+        last.1 = last_completed.1;
+    }
+    save_last_completed_order();
+}
+
+fn get_btc_value(ammount: f64) -> Option<f64> {
     let val = {
         let prices = CURRENT_PRICES.lock().unwrap();
         match prices.0 {
             Some(pr) => pr,
-            None => panic!("[{} | PRICE CALC] Can't find BTC price!", time()),
+            None => return None,
         }
     };
-    ammount * val
+    Some(ammount * val)
 }
 
-fn get_eth_value(ammount: f64) -> f64 {
+fn get_eth_value(ammount: f64) -> Option<f64> {
     let val = {
         let prices = CURRENT_PRICES.lock().unwrap();
         match prices.1 {
             Some(pr) => pr,
-            None => panic!("[{} | PRICE CALC] Can't find ETH price!", time()),
+            None => return None,
         }
     };
-    ammount * val
+    Some(ammount * val)
+}
+
+fn cancel_all_orders() -> Result<CancelAllOrdersResponse, krakenrs::Error> {
+    let api = REST_API.lock().unwrap();
+    block_in_place(|| api.cancel_all_orders())
 }
 
 fn time() -> String {
@@ -439,6 +494,7 @@ enum Command {
     Id,
     Balance,
     Price,
+    Abort,
 }
 
 
@@ -452,8 +508,18 @@ async fn answer(
         Command::Id => bot.send_message(get_report_chat_id(), parse_id(message)).await? ,
         Command::Balance => bot.send_message(get_report_chat_id(), generate_balance_string()).parse_mode(ParseMode::MarkdownV2).await?,
         Command::Price => bot.send_message(get_report_chat_id(), generate_price_string()).parse_mode(ParseMode::MarkdownV2).await?,
+        Command::Abort => bot.send_message(get_report_chat_id(), abort_order()).parse_mode(ParseMode::MarkdownV2).await?,
     };
     Ok(())
+}
+
+fn abort_order() -> String {
+    match cancel_all_orders() {
+        Ok(c) => (),
+        Err(e) => return format!("```Could not cancel order: {:#?}```", e),
+    };
+    load_previous_order();
+    "Successfully reverted order!".to_string()
 }
 
 fn generate_price_string() -> String {
@@ -503,9 +569,9 @@ fn generate_balance_string() -> String {
     for (b_key, b_val) in balance.iter() {
         let f_val = b_val.to_f64().unwrap_or(0.);
         let eur_val = if b_key.eq("XETH") {
-            get_eth_value(f_val)
+            get_eth_value(f_val).unwrap_or(0.)
         } else if b_key.eq("XXBT") {
-            get_btc_value(f_val)
+            get_btc_value(f_val).unwrap_or(0.)
         } else {
             0.
         };
@@ -529,18 +595,39 @@ fn get_report_chat_id() -> ChatId {
 }
 
 fn notify_order_placed_telegram(order_response: &AddOrderResponse, price: &f64, gain: &f64, position: &Position) {
+    let balance_option = get_account_balance();
+    
+    let balance = match balance_option {
+        Some(b) => b,
+        None => return,
+    };
+    
     let other_postition = match position {
         Position::Btc => Position::Eth,
         Position::Eth => Position::Btc,
         Position::None => Position::None,
     };
+    let volume_option = match position {
+        Position::Btc => balance.get("XXBT"),
+        Position::Eth => balance.get("XETH"),
+        Position::None => return,
+    };
+
+    let base_volume = match volume_option {
+        Some(vol) => vol.to_f64().unwrap(),
+        None => return,
+    };
+
+    let volume = converted_volume(position, base_volume);
+
     send_telegram_message(format!(
-        "Placed an order: 💰\n```\n{:?}\n```\nSummary: 📂\n```\nPRICE: {}\nGAIN: {:.3}%\nPOSITION: {:?} -> {:?}\n```", 
+        "Placed an order: 💰\n```\n{:?}\n```\nSummary: 📂\n```\nPRICE: {}\nGAIN: {:.3}%\nPOSITION: {:?} -> {:?}\nVOLUME: {:.5}\n```", 
         order_response.descr.order,
         price, 
         (gain * 100.),
         position,
         other_postition,
+        volume
     ));
 }
 
@@ -566,4 +653,8 @@ pub fn send_telegram_message(message: String) {
             }
         });
     });
+}
+
+fn notify_stream_close() {
+    send_telegram_message(format!("Stream closed from Kraken! Will try to reconnect in 5mins."));
 }
