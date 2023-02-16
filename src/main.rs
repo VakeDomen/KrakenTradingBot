@@ -5,14 +5,22 @@ use krakenrs::{KrakenRestConfig, KrakenRestAPI, KrakenCredentials, BsType, Limit
 use once_cell::sync::Lazy;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use teloxide::payloads::SendMessageSetters;
 use std::collections::{HashMap, BTreeSet};
 use std::io::{Error, ErrorKind};
 use std::sync::Mutex;
 use std::{
     time::Duration,
     thread,
+    env
 };
-
+use dotenv::dotenv;
+use teloxide::Bot;
+use teloxide::dispatching::repls::CommandReplExt;
+use teloxide::requests::Requester;
+use teloxide::requests::ResponseResult;
+use teloxide::types::{Message, ChatId, ParseMode};
+use teloxide::utils::command::BotCommands;
 
 /**
  * Last executed order price
@@ -40,6 +48,9 @@ enum Position {
 }
 
 fn main() {
+    check_env();
+
+    let _thread_handle = thread::spawn(|| { run_bot() });
 
     let ws = setup_ws();
 
@@ -147,6 +158,13 @@ fn main() {
             return; 
         }
     }
+}
+
+fn check_env() {
+    dotenv().ok();
+    let _report_chat = env::var("TELEGRAM_REPORT_CHAT_ID").expect("$TELEGRAM_REPORT_CHAT_ID is not set").parse::<i64>().unwrap();
+    let token = env::var("TELEGRAM_BOT_TOKEN").expect("$TELEGRAM_BOT_TOKEN is not set");
+    env::set_var("TELOXIDE_TOKEN", token);
 }
 
 fn update_last_order(order_response: AddOrderResponse, price: f64) {
@@ -267,6 +285,16 @@ fn calculate_gain(position: &Position) -> Option<f64> {
 fn get_currnet_relative_price() -> Option<f64> {
     let prices = CURRENT_PRICES.lock().unwrap();
     prices.2
+}
+
+fn get_currnet_eth_price() -> Option<f64> {
+    let prices = CURRENT_PRICES.lock().unwrap();
+    prices.1
+}
+
+fn get_currnet_btc_price() -> Option<f64> {
+    let prices = CURRENT_PRICES.lock().unwrap();
+    prices.0
 }
 
 fn print_prices() {
@@ -412,3 +440,111 @@ fn time() -> String {
     Local::now().format("%d-%m-%Y %H:%M:%S").to_string()
 }
 
+#[tokio::main]
+async fn run_bot() {
+    let bot = Bot::from_env();
+    Command::repl(bot, answer).await;
+}
+
+
+#[derive(BotCommands, Clone)]
+#[command(rename_rule = "lowercase", description = "These commands are supported:")]
+enum Command {
+    #[command(description = "display this text.")]
+    Id,
+    Balance,
+    Price,
+}
+
+
+async fn answer(
+    bot: Bot,
+    message: Message,
+    command: Command,
+) -> ResponseResult<()> {
+
+    match command {
+        Command::Id => bot.send_message(get_report_chat_id(), parse_id(message)).await? ,
+        Command::Balance => bot.send_message(get_report_chat_id(), generate_balance_string()).parse_mode(ParseMode::MarkdownV2).await?,
+        Command::Price => bot.send_message(get_report_chat_id(), generate_price_string()).parse_mode(ParseMode::MarkdownV2).await?,
+    };
+    Ok(())
+}
+
+fn generate_price_string() -> String {
+    let balance_handle = thread::spawn(|| {
+        get_account_balance()
+    });
+    
+    let balance = match balance_handle.join() {
+        Ok(b_option) => match b_option {
+            Some(b) => b,
+            None => return "Could not fetch balance".to_string(),
+        },
+        Err(e) => return format!("{:#?}", e),
+    };
+
+    let position = get_my_position(&balance);
+    let gain = match calculate_gain(&position) {
+        Some(gain) => gain,
+        None => return format!("Error calculating gain!"),
+    };
+
+    let icon = if gain > 0. {
+        "🟢"
+    } else {
+        "🔴"
+    };
+
+    format!(
+        "```\nRELATIVE: {:.5}\nXXBT:\t\t{:.2}\nXETH:\t\t{:.2}\nGAIN:\t\t{:.2}% {}\n```",
+        get_currnet_relative_price().unwrap(),
+        get_currnet_btc_price().unwrap(),
+        get_currnet_eth_price().unwrap(),
+        (gain * 100.),
+        icon
+    )    
+}
+
+fn generate_balance_string() -> String {
+    let balance_handle = thread::spawn(|| {
+        get_account_balance()
+    });
+    
+    let balance = match balance_handle.join() {
+        Ok(b_option) => match b_option {
+            Some(b) => b,
+            None => return "Could not fetch balance".to_string(),
+        },
+        Err(e) => return format!("{:#?}", e),
+    };
+
+    let mut out = "```".to_string();
+    for (b_key, b_val) in balance.iter() {
+        let f_val = b_val.to_f64().unwrap_or(0.);
+        let eur_val = if b_key.eq("XETH") {
+            get_eth_value(f_val)
+        } else if b_key.eq("XXBT") {
+            get_btc_value(f_val)
+        } else {
+            0.
+        };
+        let mut keyclone = b_key.clone();
+        keyclone.push_str("     ");
+        out = format!("{}\n{:.5}:  \t{:.2}€ \t({:.4})", out, keyclone, eur_val, b_val);
+    }
+    format!("{}\n```", out)
+}
+
+
+fn parse_id(message: Message) -> String {
+    format!("Your chat id: {:#?}", message.chat.id)
+}
+
+fn get_report_chat_id() -> ChatId {
+    let report_chat = env::var("TELEGRAM_REPORT_CHAT_ID")
+        .expect("$TELEGRAM_REPORT_CHAT_ID is not set")
+        .parse::<i64>()
+        .unwrap();
+    ChatId(report_chat)
+}
