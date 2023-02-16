@@ -59,15 +59,17 @@ enum Position {
 async fn main() {
     check_env();
     let _thread_handle = thread::spawn(|| { run_bot(); });
-    let ws = block_in_place(|| setup_ws());
+    let mut ws = block_in_place(|| setup_ws());
 
     let mut balance = match get_account_balance() {
         Some(balance) => balance,
         None => panic!("Couldn't get account balance!"),
     };
     let mut balance_stained = false;
+    let reconnect_timer = 30; // reconnect timer in seconds
     let mut time_to_wait_in_millis = 5000;
-
+    let order_abort_timeout = 60; // in loop resolutons (30s * X)
+    let mut order_abort_count = 0;
     /*
      * reconnection loop 
      */
@@ -76,6 +78,16 @@ async fn main() {
         * main loop
         */
         loop {
+
+            /*
+            * stop loop on stream closed 
+            */
+            if ws.stream_closed() { 
+                println!("Stream closed");
+                notify_stream_close();
+                break; 
+            }
+
             /*
             * slow down the loop
             */ 
@@ -93,12 +105,18 @@ async fn main() {
                         if ord.open.len() == 0 {
                             complete_last_order();
                             time_to_wait_in_millis = 5000;
+                            order_abort_count = 0;
                             notify_order_completed_telegram();
                         }
                     },
                     Err(e) => { println!("[{} | ORDER RESOLUTION WAIT] Could not fetch open orders: {}", time(), e.to_string())},
                 }
                 println!("[{} | ORDER RESOLUTION WAIT] Waiting for order to resolve", time());
+                if order_abort_count > order_abort_timeout {
+                    abort_order();
+                } else {
+                    order_abort_count += 1;
+                }
                 continue;
             }
 
@@ -156,18 +174,15 @@ async fn main() {
                 };
             }
 
-            /*
-            * stop loop on stream closed 
-            */
-            if ws.stream_closed() { 
-                println!("Stream closed");
-                notify_stream_close();
-                break; 
-            }
         }
-        thread::sleep(Duration::from_secs(10))
+        thread::sleep(Duration::from_secs(reconnect_timer));
+        ws = block_in_place(|| setup_ws());
+        if !ws.stream_closed() {
+            notify_successful_reconnect();
+        }
     }
 }
+
 
 
 
@@ -508,12 +523,12 @@ async fn answer(
         Command::Id => bot.send_message(get_report_chat_id(), parse_id(message)).await? ,
         Command::Balance => bot.send_message(get_report_chat_id(), generate_balance_string()).parse_mode(ParseMode::MarkdownV2).await?,
         Command::Price => bot.send_message(get_report_chat_id(), generate_price_string()).parse_mode(ParseMode::MarkdownV2).await?,
-        Command::Abort => bot.send_message(get_report_chat_id(), abort_order()).parse_mode(ParseMode::MarkdownV2).await?,
+        Command::Abort => bot.send_message(get_report_chat_id(), abort_order_command()).parse_mode(ParseMode::MarkdownV2).await?,
     };
     Ok(())
 }
 
-fn abort_order() -> String {
+fn abort_order_command() -> String {
     match cancel_all_orders() {
         Ok(c) => (),
         Err(e) => return format!("```Could not cancel order: {:#?}```", e),
@@ -656,5 +671,18 @@ pub fn send_telegram_message(message: String) {
 }
 
 fn notify_stream_close() {
-    send_telegram_message(format!("Stream closed from Kraken! Will try to reconnect in 5mins."));
+    send_telegram_message(format!("Stream closed from Kraken! Will try to reconnect in 5mins. 🔧"));
+}
+
+fn notify_successful_reconnect() {
+    send_telegram_message(format!("Reconnect to Kraken successful. 👍"));
+}
+
+fn abort_order() {
+    match cancel_all_orders() {
+        Ok(c) => (),
+        Err(e) => send_telegram_message(format!("```Could not revert order after timeout: {:#?}```", e)),
+    };
+    load_previous_order();
+    send_telegram_message(format!("Timeout! Successfully reverted order! 👍"))
 }
