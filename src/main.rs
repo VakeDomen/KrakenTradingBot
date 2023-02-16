@@ -6,6 +6,8 @@ use once_cell::sync::Lazy;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use teloxide::payloads::SendMessageSetters;
+use tokio::runtime::Handle;
+use tokio::task::block_in_place;
 use std::collections::{HashMap, BTreeSet};
 use std::io::{Error, ErrorKind};
 use std::sync::Mutex;
@@ -37,7 +39,7 @@ pub static CURRENT_PRICES: Lazy<Mutex<(Option<f64>, Option<f64>, Option<f64>)>> 
 });
 
 pub static REST_API: Lazy<Mutex<KrakenRestAPI>> = Lazy::new(|| {
-    Mutex::new(setup_rest())
+    Mutex::new(block_in_place(|| setup_rest()))
 });
 
 #[derive(Debug)]
@@ -47,26 +49,17 @@ enum Position {
     None,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     check_env();
+    let _thread_handle = thread::spawn(|| { run_bot(); });
+    let ws = block_in_place(|| setup_ws());
 
-    let _thread_handle = thread::spawn(|| { run_bot() });
-
-    let ws = setup_ws();
-
-    {
-        let last = LAST_ORDER.lock().unwrap();   
-        println!("{:#?}", last);
-    }
     let mut balance = match get_account_balance() {
         Some(balance) => balance,
         None => panic!("Couldn't get account balance!"),
     };
     let mut balance_stained = false;
-    // for (b_key, b_val) in balance.iter() {
-    //     println!("{}: {}", b_key, b_val);
-    // }
-
     let mut time_to_wait_in_millis = 1000;
 
     loop {
@@ -74,7 +67,6 @@ fn main() {
          * slow down the loop
          */ 
         thread::sleep(Duration::from_millis(time_to_wait_in_millis));
-
         /*
          *  check order resolution update 
          *  NOTE: must be above balance update, so it 
@@ -88,6 +80,7 @@ fn main() {
                     if ord.open.len() == 0 {
                         complete_last_order();
                         time_to_wait_in_millis = 5000;
+                        notify_order_completed_telegram();
                     }
                 },
                 Err(e) => { println!("[{} | ORDER RESOLUTION WAIT] Could not fetch open orders: {}", time(), e.to_string())},
@@ -99,7 +92,7 @@ fn main() {
         /*
          * update prices on tick
          */
-        update_prices(ws.get_all_books());
+        update_prices(block_in_place(|| ws.get_all_books()));
 
         /*
          * get my balance
@@ -131,7 +124,7 @@ fn main() {
          * hop strat eval
          */
         let should_hop = match position {
-            Position::Btc => gain > 0.02,
+            Position::Btc => gain > 0.017,
             Position::Eth => gain > 0.05,
             Position::None => false,
         };
@@ -140,11 +133,12 @@ fn main() {
          * execute hop
          */
         if should_hop {
-            match execute_hop(position, &balance) {
+            match execute_hop(&position, &balance) {
                 Ok((order_response, price)) => {
-                    println!("SLO JE!!!: {:#?}", order_response); 
-                    update_last_order(order_response, price);
+                    println!("[{} | EXECUTED TRADE] Order placed: {:#?}", time(), order_response); 
+                    update_last_order(price);
                     balance_stained = true;
+                    notify_order_placed_telegram(&order_response, &price, &gain, &position);
                 },
                 Err(e) => panic!("PANIC: {}", e.to_string())
             };
@@ -167,7 +161,7 @@ fn check_env() {
     env::set_var("TELOXIDE_TOKEN", token);
 }
 
-fn update_last_order(order_response: AddOrderResponse, price: f64) {
+fn update_last_order(price: f64) {
     {
         let mut last = LAST_ORDER.lock().unwrap();
         last.0 = price;
@@ -186,7 +180,7 @@ fn complete_last_order() {
 
 fn get_open_orders() -> Result<GetOpenOrdersResponse, krakenrs::Error> {
     let api = REST_API.lock().unwrap();
-    api.get_open_orders(None)
+    block_in_place(|| api.get_open_orders(None))
 }
 
 fn is_waiting_order_resolution() -> bool {
@@ -194,7 +188,7 @@ fn is_waiting_order_resolution() -> bool {
     !last.1
 }
 
-fn execute_hop(position: Position, balance: &HashMap<String, Decimal>) -> Result<(AddOrderResponse, f64), Error> {
+fn execute_hop(position: &Position, balance: &HashMap<String, Decimal>) -> Result<(AddOrderResponse, f64), Error> {
     let bs_type = match position {
         Position::Btc => BsType::Buy,
         Position::Eth => BsType::Sell,
@@ -241,7 +235,7 @@ fn execute_hop(position: Position, balance: &HashMap<String, Decimal>) -> Result
         price,
         oflags,
     };
-    match api.add_limit_order(
+    block_in_place(|| match api.add_limit_order(
         limit_order, 
         None, 
         true
@@ -251,7 +245,7 @@ fn execute_hop(position: Position, balance: &HashMap<String, Decimal>) -> Result
             ErrorKind::Other, 
             format!("[{} | EXECUTE HOP] Error executing transaction: {}", time(), e.to_string())
         )),
-    }
+    })
 }
 
 fn round_to_precision(num: f64) -> f64 {
@@ -297,15 +291,6 @@ fn get_currnet_btc_price() -> Option<f64> {
     prices.0
 }
 
-fn print_prices() {
-    let prices = CURRENT_PRICES.lock().unwrap();
-    println!("****** PRICES ******");
-    println!("ETH/XBT: {:#?}", prices.2.unwrap_or(0.));
-    println!("ETH: {:#?}€", prices.1.unwrap_or(0.));
-    println!("BTC: {:#?}€", prices.0.unwrap_or(0.));
-    println!("********************");
-}
-
 fn update_prices(books: std::collections::BTreeMap<String, BookData>) {
     for (book_id, book) in books.iter() {
         let (bids, asks) = extract_bids_and_asks_from_book(book);
@@ -339,13 +324,13 @@ fn update_price(book_id: &str, current_price: f64) {
 
 fn get_account_balance() -> Option<HashMap<String, Decimal>> {
     let rest = REST_API.lock().unwrap();
-    match rest.get_account_balance() {
+    block_in_place(|| match rest.get_account_balance() {
         Ok(bal) => Some(bal),
         Err(e) => {
             println!("[{} | GET ACCOUTN BALANCE] Error: {:#?}", time(), e);    
             None
         }
-    }
+    })
 }
 
 fn extract_bids_and_asks_from_book(book: &BookData) -> (Vec<f64>, Vec<f64>) {
@@ -507,16 +492,11 @@ fn generate_price_string() -> String {
 }
 
 fn generate_balance_string() -> String {
-    let balance_handle = thread::spawn(|| {
-        get_account_balance()
-    });
+    let balance_option = get_account_balance();
     
-    let balance = match balance_handle.join() {
-        Ok(b_option) => match b_option {
-            Some(b) => b,
-            None => return "Could not fetch balance".to_string(),
-        },
-        Err(e) => return format!("{:#?}", e),
+    let balance = match balance_option {
+        Some(b) => b,
+        None => return "Could not fetch balance".to_string(),
     };
 
     let mut out = "```".to_string();
@@ -536,7 +516,6 @@ fn generate_balance_string() -> String {
     format!("{}\n```", out)
 }
 
-
 fn parse_id(message: Message) -> String {
     format!("Your chat id: {:#?}", message.chat.id)
 }
@@ -547,4 +526,44 @@ fn get_report_chat_id() -> ChatId {
         .parse::<i64>()
         .unwrap();
     ChatId(report_chat)
+}
+
+fn notify_order_placed_telegram(order_response: &AddOrderResponse, price: &f64, gain: &f64, position: &Position) {
+    let other_postition = match position {
+        Position::Btc => Position::Eth,
+        Position::Eth => Position::Btc,
+        Position::None => Position::None,
+    };
+    send_telegram_message(format!(
+        "Placed an order: 💰\n```\n{:?}\n```\nSummary: 📂\n```\nPRICE: {}\nGAIN: {:.3}%\nPOSITION: {:?} -> {:?}\n```", 
+        order_response.descr.order,
+        price, 
+        (gain * 100.),
+        position,
+        other_postition,
+    ));
+}
+
+fn notify_order_completed_telegram() {
+    send_telegram_message(format!("Last order seems to have been filled 🎉💰"));
+}
+
+
+pub fn send_telegram_message(message: String) {
+    let report_chat = env::var("TELEGRAM_REPORT_CHAT_ID")
+        .expect("$TELEGRAM_REPORT_CHAT_ID is not set")
+        .parse::<i64>()
+        .unwrap();
+
+    block_in_place( move || {
+        Handle::current().block_on(async move {
+            match Bot::from_env().send_message(
+                ChatId(report_chat),
+                message
+            ).parse_mode(ParseMode::MarkdownV2).await {
+                Ok(e) => println!("Sent message: {:?}", e),
+                Err(e) => println!("Error sending message {:#?}", e),
+            }
+        });
+    });
 }

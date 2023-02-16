@@ -14,4 +14,4 @@ serde_any = "0.5.0"
 serde = { version = "1.0", features = ["derive"] }
 chrono = "0.4.23"
 teloxide = { version = "0.11.3", features = ["macros", "auto-send"] }
-tokio = { version = "1", features = ["full"] }
+tokio = "1"
