@@ -47,6 +47,8 @@ pub static CURRENT_PRICES: Lazy<Mutex<(Option<f64>, Option<f64>, Option<f64>)>> 
 pub static REST_API: Lazy<Mutex<KrakenRestAPI>> = Lazy::new(|| {
     Mutex::new(block_in_place(|| setup_rest()))
 });
+pub static TO_BTC: f64 = 0.03;
+pub static TO_ETH: f64 = 0.02;
 
 #[derive(Debug)]
 enum Position {
@@ -154,8 +156,8 @@ async fn main() {
             * hop strat eval
             */
             let should_hop = match position {
-                Position::Btc => gain > 0.02,
-                Position::Eth => gain > 0.05,
+                Position::Btc => gain > TO_ETH,
+                Position::Eth => gain > TO_BTC,
                 Position::None => false,
             };
 
@@ -506,6 +508,7 @@ async fn run_bot() {
 #[command(rename_rule = "lowercase", description = "These commands are supported:")]
 enum Command {
     #[command(description = "display this text.")]
+    Help,
     Id,
     Balance,
     Price,
@@ -520,6 +523,7 @@ async fn answer(
 ) -> ResponseResult<()> {
 
     match command {
+        Command::Help => bot.send_message(get_report_chat_id(), Command::descriptions().to_string()).await?,
         Command::Id => bot.send_message(get_report_chat_id(), parse_id(message)).await? ,
         Command::Balance => bot.send_message(get_report_chat_id(), generate_balance_string()).parse_mode(ParseMode::MarkdownV2).await?,
         Command::Price => bot.send_message(get_report_chat_id(), generate_price_string()).parse_mode(ParseMode::MarkdownV2).await?,
