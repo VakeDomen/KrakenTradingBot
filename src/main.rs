@@ -325,6 +325,19 @@ fn calculate_gain(position: &Position) -> Option<f64> {
     }
 }
 
+fn calculate_threshold_value(position: &Position) -> Option<f64> {
+    let (last_value, last_completed) = get_last_trade();
+    if !last_completed {
+        return None;
+    }
+
+    match position {
+        Position::Btc => Some(last_value * (1. + TO_ETH)),
+        Position::Eth => Some(last_value * (1. + TO_BTC)),
+        Position::None => return None,
+    }
+}
+
 fn get_currnet_relative_price() -> Option<f64> {
     let prices = CURRENT_PRICES.lock().unwrap();
     prices.2
@@ -553,26 +566,32 @@ fn generate_price_string() -> String {
         },
         Err(e) => return format!("{:#?}", e),
     };
-
     let position = get_my_position(&balance);
-    let gain = match calculate_gain(&position) {
-        Some(gain) => gain,
-        None => return format!("Error calculating gain!"),
+    
+    let threshold_value = match calculate_threshold_value(&position) {
+        Some(val) => format!("{}", val),
+        None => "Unknown".to_string(),
     };
 
-    let icon = if gain > 0. {
-        "🟢"
-    } else {
-        "🔴"
+    let gain = match calculate_gain(&position) {
+        Some(val) => {
+            let color = if val > 0. {
+                "🟢"
+            } else {
+                "🔴"
+            };
+            format!("{:.2}% {}", (val * 100.), color)
+        },
+        None => "Unknown".to_string(),
     };
 
     format!(
-        "```\nRELATIVE: {:.5}\nXXBT:\t\t{:.2}\nXETH:\t\t{:.2}\nGAIN:\t\t{:.2}% {}\n```",
+        "```\nRELATIVE: {:.5}\nXXBT:\t\t{:.2}\nXETH:\t\t{:.2}\nGAIN:\t\t{}\nTHRESHOLD:\t\t{:.5}\n```",
         get_currnet_relative_price().unwrap(),
         get_currnet_btc_price().unwrap(),
         get_currnet_eth_price().unwrap(),
-        (gain * 100.),
-        icon
+        gain,
+        threshold_value,
     )    
 }
 
