@@ -601,7 +601,7 @@ fn generate_price_string() -> String {
     };
 
     format!(
-        "```\nPOSITION: \t{:?}\nRELATIVE: \t{}\nTHRESHOLD:\t\t{}\nGAIN:\t\t\t\t{}\nXXBT:\t\t\t\t{}\nXETH:\t\t\t\t{}\n```",
+        "```\nPOSITION:   {:?}\nRELATIVE:   {}\nTHRESHOLD:  {}\nGAIN:       {}\nXXBT:       {}\nXETH:       {}\n```",
         position,
         relative_price,
         threshold_value,
