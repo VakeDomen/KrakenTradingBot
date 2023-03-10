@@ -172,7 +172,7 @@ async fn main() {
                         balance_stained = true;
                         notify_order_placed_telegram(&order_response, &price, &gain, &position);
                     },
-                    Err(e) => panic!("PANIC: {}", e.to_string())
+                    Err(e) => panic!("[{} | EXECUTED TRADE] PANIC: {}", time(), e.to_string())
                 };
             }
 
@@ -418,7 +418,7 @@ fn setup_ws() -> KrakenWsAPI {
 fn setup_rest() -> KrakenRestAPI {
     let creds = match KrakenCredentials::load_json_file("./creds.json") {
         Ok(creds) => creds,
-        Err(e) => panic!("{}", e.to_string()),
+        Err(e) => panic!("SETUP REST PANIC: {}", e.to_string()),
     };
     let mut kraken_config = KrakenRestConfig::default();
     kraken_config.creds = creds;
@@ -569,7 +569,7 @@ fn generate_price_string() -> String {
     let position = get_my_position(&balance);
     
     let threshold_value = match calculate_threshold_value(&position) {
-        Some(val) => format!("{}", val),
+        Some(val) => format!("{:.5}", val),
         None => "Unknown".to_string(),
     };
 
@@ -585,11 +585,26 @@ fn generate_price_string() -> String {
         None => "Unknown".to_string(),
     };
 
+    let relative_price = match get_currnet_relative_price() {
+        Some(p) => format!("{:.5}", p),
+        None => "Unknown".to_string(),
+    };
+
+    let btc_price = match get_currnet_btc_price() {
+        Some(p) => format!("{:.2}", p),
+        None => "Unknown".to_string(),
+    };
+
+    let eth_price = match get_currnet_eth_price() {
+        Some(p) => format!("{:.2}", p),
+        None => "Unknown".to_string(),
+    };
+
     format!(
-        "```\nRELATIVE: {:.5}\nXXBT:\t\t{:.2}\nXETH:\t\t{:.2}\nGAIN:\t\t{}\nTHRESHOLD:\t\t{:.5}\n```",
-        get_currnet_relative_price().unwrap(),
-        get_currnet_btc_price().unwrap(),
-        get_currnet_eth_price().unwrap(),
+        "```\nRELATIVE: {}\nXXBT:\t\t{}\nXETH:\t\t{}\nGAIN:\t\t{}\nTHRESHOLD:\t\t{}\n```",
+        relative_price,
+        btc_price,
+        eth_price,
         gain,
         threshold_value,
     )    
