@@ -332,7 +332,7 @@ fn calculate_threshold_value(position: &Position) -> Option<f64> {
     }
 
     match position {
-        Position::Btc => Some(last_value * (1. + TO_ETH)),
+        Position::Btc => Some(last_value * (1. - TO_ETH)),
         Position::Eth => Some(last_value * (1. + TO_BTC)),
         Position::None => return None,
     }
