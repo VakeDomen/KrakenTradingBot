@@ -6,3 +6,14 @@ TELEGRAM_REPORT_CHAT_ID=
 ```
 
 `TELEGRAM_BOT_TOKEN` corresponds to the token created by telegram BotFather and enables bot reporting via Telegram. `TELEGRAM_REPORT_CHAT_ID` is the id of the chat to report to (your private chat id). 
+
+## Building and running
+Build with:
+```
+cargo build --release
+```
+
+and run with:
+```
+./run.sh
+```
